@@ -23,3 +23,7 @@ target
 .omx/
 
 **/.DS_Store
+
+# macOS Python bytecode cache shadow tree (created when system Python runs
+# with HOME pointing at the repo)
+Library/

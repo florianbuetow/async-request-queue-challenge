@@ -117,7 +117,7 @@ These findings were turned into **7 new semgrep rules** (under `config/semgrep/`
 
 ### The Key Insight
 
-What we do here is convert every piece of human feedback into automatically enforceable requirements — guardrails and additional tests. This means the AI cannot make the same mistakes again. What many people don't realise is that AI is excellent at self-correcting when it receives proper feedback from its environment. This is how you iteratively build a system that requires minimal human review. You could also simply search for Rust best practices, idiomatic patterns, etc. and generate a set of rules the AI must follow — achieving a similar effect. This is how you turn vibe-coding into **guardrail-driven development**.
+What we do here is convert every piece of human feedback into automatically enforceable requirements — guardrails and additional tests. This means the AI cannot make the same mistakes again. AI is excellent at self-correcting when it receives proper feedback from its environment. This is how you iteratively build a system that requires minimal human review. You could also simply search for Rust best practices, idiomatic patterns, etc. and generate a set of rules the AI must follow — achieving a similar effect. This is how you turn vibe-coding into **guardrail-driven development**.
 
 # Conclusion
 

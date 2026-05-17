@@ -6,6 +6,45 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const CAPACITY_STANDARD: usize = 4;
+const ENQUEUE_TIMEOUT_MS: u64 = 100;
+const EXECUTION_TIMEOUT_MS: u64 = 100;
+const EXECUTION_TIMEOUT_SHORT_MS: u64 = 10;
+const JOB_SLEEP_MS: u64 = 200;
+const SECOND_REQUEST_TIMEOUT_MS: u64 = 80;
+const REPLY_TIMEOUT_S: u64 = 2;
+const SHUTDOWN_TIMEOUT_S: u64 = 1;
+const EXPECTED_FOLLOW_UP: u32 = 11;
+const EXPECTED_SECOND_VALUE: u32 = 2;
+
+const fn enqueue_timeout() -> Duration {
+    Duration::from_millis(ENQUEUE_TIMEOUT_MS)
+}
+
+const fn execution_timeout() -> Duration {
+    Duration::from_millis(EXECUTION_TIMEOUT_MS)
+}
+
+const fn execution_timeout_short() -> Duration {
+    Duration::from_millis(EXECUTION_TIMEOUT_SHORT_MS)
+}
+
+const fn reply_timeout() -> Duration {
+    Duration::from_secs(REPLY_TIMEOUT_S)
+}
+
+const fn shutdown_timeout() -> Duration {
+    Duration::from_secs(SHUTDOWN_TIMEOUT_S)
+}
+
+const fn blocking_sleep_duration() -> Duration {
+    Duration::from_millis(JOB_SLEEP_MS)
+}
+
+const fn second_request_timeout() -> Duration {
+    Duration::from_millis(SECOND_REQUEST_TIMEOUT_MS)
+}
+
 fn panic_before_future() -> impl Future<Output = Result<u32, RequestQueueError>> + Send {
     let should_panic = true;
     assert!(!should_panic, "factory panic before creating future");
@@ -14,10 +53,10 @@ fn panic_before_future() -> impl Future<Output = Result<u32, RequestQueueError>>
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(error) => panic!("system clock is before unix epoch: {error}"),
-    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
 
     let mut dir = std::env::temp_dir();
     dir.push(format!("{prefix}-{nanos}"));
@@ -27,95 +66,86 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 #[tokio::test]
 async fn factory_panic_isolated_and_queue_recovers() {
     let config = QueueConfig {
-        capacity: 4,
-        enqueue_timeout: Duration::from_millis(100),
-        execution_timeout: Duration::from_millis(100),
-        reply_timeout: Duration::from_secs(2),
+        capacity: CAPACITY_STANDARD,
+        enqueue_timeout: enqueue_timeout(),
+        execution_timeout: execution_timeout(),
+        reply_timeout: reply_timeout(),
     };
 
-    let create_result = RequestQueue::<u32>::new(config);
-    let (queue, shutdown) = match create_result {
-        Ok(ok) => ok,
-        Err(error) => panic!("failed to create queue: {error}"),
-    };
+    let (queue, shutdown) = RequestQueue::<u32>::new(config).expect("queue construction should succeed");
 
     let panic_result = queue.enqueue(panic_before_future).await;
+    assert!(
+        matches!(panic_result, Err(RequestQueueError::JobPanicked)),
+        "expected JobPanicked, got: {panic_result:?}"
+    );
 
-    match panic_result {
-        Err(RequestQueueError::JobPanicked) => {}
-        Ok(value) => panic!("expected JobPanicked, got success value: {value}"),
-        Err(error) => panic!("expected JobPanicked, got different error: {error}"),
-    }
-
-    let follow_up = queue.enqueue(|| async { Ok(11) }).await;
-    match follow_up {
-        Ok(value) => assert_eq!(value, 11),
-        Err(error) => panic!("queue did not recover after factory panic: {error}"),
-    }
+    let follow_up = queue.enqueue(|| async { Ok(EXPECTED_FOLLOW_UP) }).await;
+    assert_eq!(follow_up, Ok(EXPECTED_FOLLOW_UP), "queue should recover after panic");
 
     drop(queue);
-    let shutdown_result = tokio::time::timeout(Duration::from_secs(1), shutdown.wait()).await;
-    match shutdown_result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => panic!("shutdown failed unexpectedly: {error}"),
-        Err(elapsed) => panic!("shutdown timed out unexpectedly: {elapsed}"),
-    }
+
+    let shutdown_result = tokio::time::timeout(shutdown_timeout(), shutdown.wait()).await;
+    assert!(
+        shutdown_result.is_ok(),
+        "shutdown should complete within timeout, got: {shutdown_result:?}"
+    );
+
+    let wait_result = shutdown_result.expect("timeout branch already asserted as impossible");
+    assert_eq!(wait_result, Ok(()), "shutdown should complete cleanly");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread")]
 async fn blocking_job_timeout_does_not_stall_queue() {
     let config = QueueConfig {
-        capacity: 4,
-        enqueue_timeout: Duration::from_millis(100),
-        execution_timeout: Duration::from_millis(10),
-        reply_timeout: Duration::from_secs(2),
+        capacity: CAPACITY_STANDARD,
+        enqueue_timeout: enqueue_timeout(),
+        execution_timeout: execution_timeout_short(),
+        reply_timeout: reply_timeout(),
     };
 
-    let create_result = RequestQueue::<u32>::new(config);
-    let (queue, shutdown) = match create_result {
-        Ok(ok) => ok,
-        Err(error) => panic!("failed to create queue: {error}"),
-    };
+    let (queue, shutdown) = RequestQueue::<u32>::new(config).expect("queue construction should succeed");
 
     let timeout_result = queue
         .enqueue(|| async {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(blocking_sleep_duration());
             Ok(1)
         })
         .await;
 
-    match timeout_result {
-        Err(RequestQueueError::ExecutionTimedOut { timeout }) => {
-            assert_eq!(timeout, Duration::from_millis(10));
-        }
-        Ok(value) => panic!("expected timeout, got success value: {value}"),
-        Err(error) => panic!("expected timeout, got different error: {error}"),
-    }
+    assert!(
+        matches!(
+            timeout_result,
+            Err(RequestQueueError::ExecutionTimedOut { timeout }) if timeout == execution_timeout_short()
+        ),
+        "expected ExecutionTimedOut with short timeout, got: {timeout_result:?}"
+    );
 
-    let second_result = tokio::time::timeout(Duration::from_millis(80), queue.enqueue(|| async { Ok(2) })).await;
+    let second_result = tokio::time::timeout(second_request_timeout(), queue.enqueue(|| async { Ok(EXPECTED_SECOND_VALUE) })).await;
 
-    match second_result {
-        Ok(Ok(value)) => assert_eq!(value, 2),
-        Ok(Err(error)) => panic!("second request failed unexpectedly: {error}"),
-        Err(elapsed) => panic!("queue remained stalled after timeout: {elapsed}"),
-    }
+    let second_queue_result = second_result.expect("queue should not remain stalled after execution timeout");
+    assert_eq!(
+        second_queue_result,
+        Ok(EXPECTED_SECOND_VALUE),
+        "follow-up request should succeed after timeout"
+    );
 
     drop(queue);
-    let shutdown_result = tokio::time::timeout(Duration::from_secs(1), shutdown.wait()).await;
-    match shutdown_result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => panic!("shutdown failed unexpectedly: {error}"),
-        Err(elapsed) => panic!("shutdown timed out unexpectedly: {elapsed}"),
-    }
+
+    let shutdown_result = tokio::time::timeout(shutdown_timeout(), shutdown.wait()).await;
+    assert!(
+        shutdown_result.is_ok(),
+        "shutdown should complete within timeout, got: {shutdown_result:?}"
+    );
+
+    let wait_result = shutdown_result.expect("timeout branch already asserted as impossible");
+    assert_eq!(wait_result, Ok(()), "shutdown should complete cleanly");
 }
 
 #[test]
 fn code_security_fails_when_geiger_fails_even_with_valid_looking_output() {
     let fake_bin_dir = unique_temp_dir("fake-cargo-bin");
-
-    if let Err(error) = std::fs::create_dir_all(&fake_bin_dir) {
-        panic!("failed to create fake cargo dir: {error}");
-    }
+    std::fs::create_dir_all(&fake_bin_dir).expect("failed to create fake cargo dir");
 
     let fake_cargo_path = fake_bin_dir.join("cargo");
     let script = r#"#!/usr/bin/env bash
@@ -128,35 +158,22 @@ printf "unexpected cargo invocation: %s\n" "$*" >&2
 exit 99
 "#;
 
-    match std::fs::File::create(&fake_cargo_path) {
-        Ok(mut file) => {
-            if let Err(error) = file.write_all(script.as_bytes()) {
-                panic!("failed writing fake cargo script: {error}");
-            }
-        }
-        Err(error) => panic!("failed creating fake cargo script: {error}"),
-    }
+    let mut file = std::fs::File::create(&fake_cargo_path).expect("failed creating fake cargo script");
+    file.write_all(script.as_bytes()).expect("failed writing fake cargo script");
 
-    let metadata = match std::fs::metadata(&fake_cargo_path) {
-        Ok(meta) => meta,
-        Err(error) => panic!("failed reading fake cargo metadata: {error}"),
-    };
+    let metadata = std::fs::metadata(&fake_cargo_path).expect("failed reading fake cargo metadata");
     let mut permissions = metadata.permissions();
     permissions.set_mode(0o755);
-    if let Err(error) = std::fs::set_permissions(&fake_cargo_path, permissions) {
-        panic!("failed making fake cargo executable: {error}");
-    }
+    std::fs::set_permissions(&fake_cargo_path, permissions).expect("failed making fake cargo executable");
 
-    let original_path = match std::env::var("PATH") {
-        Ok(path) => path,
-        Err(error) => panic!("PATH is unavailable: {error}"),
-    };
+    let original_path = std::env::var("PATH").expect("PATH should be available for test execution");
     let composite_path = format!("{}:{}", fake_bin_dir.display(), original_path);
 
-    let output = match Command::new("just").arg("code-security").env("PATH", composite_path).output() {
-        Ok(out) => out,
-        Err(error) => panic!("failed to run just code-security: {error}"),
-    };
+    let output = Command::new("just")
+        .arg("code-security")
+        .env("PATH", composite_path)
+        .output()
+        .expect("failed to run just code-security");
 
     assert!(
         !output.status.success(),

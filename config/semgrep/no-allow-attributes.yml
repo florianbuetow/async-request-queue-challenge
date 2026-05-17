@@ -1,0 +1,12 @@
+rules:
+  - id: no-allow-attributes
+    pattern-regex: '#\[allow\('
+    message: >
+      Do not use #[allow(...)] to suppress warnings. Fix the underlying issue
+      instead. If a lint is genuinely wrong, document why and use
+      #[expect(...)] with a reason string instead.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - src/

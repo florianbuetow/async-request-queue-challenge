@@ -64,7 +64,7 @@ You can review the full session log here: [`docs/SESSION_CODEX_IMPLEMENTATION.md
 
 Codex was done. I decided to review the code using two different AIs.
 
-For that I launched Claude code in two different teminals
+For that I launched Claude code in two different terminals
 
 ```
 claude
@@ -101,6 +101,23 @@ I performed an adversarial review. I want you to cfreate tests to confirm the is
 <CLAUDE ADVERSARIAL REVIEW>
 ```
 
+
+## Step 6: Human Code Review
+
+After the AI-driven implementation and adversarial reviews, a human reviewer looked at the code and identified several issues that neither AI had caught or fully addressed:
+
+1. **Nested type aliases that hurt readability** (`BoxJobFuture`, `BoxJobFactory`) — obscure indirection that makes the code harder to follow than inline types would be.
+2. **Manual `Pin<Box<dyn Future>>` constructs** instead of spawning tasks directly — unnecessary complexity when `tokio::spawn` already returns a `JoinHandle`.
+3. **`eprintln!` instead of proper error propagation** — the specification explicitly calls for structured error handling, yet errors were silently logged to stderr.
+4. **Tests that only confirm *something* went wrong, not *what*** — panics and opaque assertions instead of clear, idiomatic assertions that pinpoint the failure.
+5. **Magic numbers everywhere** — bare `Duration::from_millis(100)` literals scattered across the codebase with no named constants.
+6. **Public fields on every struct** — no encapsulation; internal state exposed where accessor methods or builder patterns belong.
+
+These findings were turned into **7 new semgrep rules** (under `config/semgrep/`) so the CI pipeline now rejects code that reintroduces these patterns. The source code was then refactored to pass the new rules.
+
+### The Key Insight
+
+What we do here is convert every piece of human feedback into automatically enforceable requirements — guardrails and additional tests. This means the AI cannot make the same mistakes again. What many people don't realise is that AI is excellent at self-correcting when it receives proper feedback from its environment. This is how you iteratively build a system that requires minimal human review. You could also simply search for Rust best practices, idiomatic patterns, etc. and generate a set of rules the AI must follow — achieving a similar effect. This is how you turn vibe-coding into **guardrail-driven development**.
 
 # Conclusion
 

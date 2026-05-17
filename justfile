@@ -223,7 +223,7 @@ code-spell:
 code-semgrep:
     @echo ""
     @printf "\033[0;34m=== Running Semgrep Static Analysis ===\033[0m\n"
-    @semgrep --config config/semgrep/ --error src scripts
+    @SEMGREP_ENABLE_VERSION_CHECK=0 SEMGREP_SEND_METRICS=off semgrep --config config/semgrep/ --error src tests scripts
     @printf "\033[0;32m> Semgrep checks passed\033[0m\n"
     @echo ""
 

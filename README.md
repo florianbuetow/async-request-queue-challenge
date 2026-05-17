@@ -239,4 +239,4 @@ See [AGENTS.md](AGENTS.md) for detailed development guidelines including:
 
 ## License
 
-<!-- Add your license here -->
+This project is released under the [MIT License](LICENCE).

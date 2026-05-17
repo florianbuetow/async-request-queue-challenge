@@ -1,0 +1,95 @@
+# AGENTS.md
+
+This file provides guidance to AI agents and AI-assisted development tools when working on this codebase.
+
+## Project Overview
+
+A Python CLI application
+
+- **Language**: Rust 2024 edition
+- **Build system**: Cargo
+- **Task runner**: Just (`justfile`)
+- **Error handling**: anyhow + thiserror
+
+## Build & Test Commands
+
+- `just help` -- Show all available commands
+- `just init` -- Install dependencies and dev tools
+- `just run` -- Run the application
+- `just test` -- Run tests with cargo-nextest
+- `just ci` -- Run full CI pipeline (format, lint, security, test)
+- `just ci-quiet` -- Run CI silently (only show output on errors)
+- `just destroy` -- Remove build artifacts and reports
+
+## Justfile Conventions
+- **Use `printf` for colored or formatted output** — never `echo` with ANSI escape sequences, as some terminals won't render colors with `echo`. Plain `echo ""` is acceptable only for blank-line spacing.
+- **Add an empty `@echo ""` line before and after each target's command block** to visually separate output between targets.
+- **The `help` target must be a dedicated recipe** with manually written `printf` lines that group related commands and order them by typical execution flow (setup → run → code quality → testing). Never use `just --list`.
+- **The default target (`_default`) must call `just help`.**
+- **Every target must end with a clear status message**: green (`\033[32m`) on success, red (`\033[31m`) on failure with `exit 1`.
+- **Composite targets (e.g. `ci`) must fail fast**: use `set -e` or `&&` chaining.
+- Use `cargo` commands only — never invoke `rustc` directly
+
+## General Coding Principles
+
+- **Fail fast — never swallow errors.** Always propagate errors and exit with code 1 immediately. No silent fallbacks, no `.unwrap_or()`, no ignored Results.
+- **Never assume any default values anywhere.** Check for required values explicitly and fail if something is missing. Default values mask underlying issues and make them hard to debug.
+- **Never suppress checks with annotations.** Fix the underlying issue instead. No `#[allow(...)]` — use `#[expect(...)]` with a reason only when absolutely unavoidable. No other mechanism that silences a checker.
+
+## Code Style & Conventions
+
+### Rust Rules
+
+- Use `cargo` commands only -- never invoke `rustc` directly
+- Use the `?` operator for error propagation -- never `.unwrap()`
+- Define custom error types with `thiserror` -- use `anyhow` at boundaries
+- Never use `#[allow(...)]` -- fix the underlying issue or use `#[expect(...)]` with a reason
+- Never use `let _ = expr;` to discard Results -- handle the error
+- Never use `.unwrap_or()`, `.unwrap_or_default()`, `.unwrap_or_else()` as silent fallbacks
+- No `unsafe` code without explicit justification and review
+- All public items must have documentation comments
+- Follow `rustfmt` formatting -- do not override style settings
+
+### Project Structure
+
+```
+src/           -- Application source code
+tests/         -- Integration tests
+config/        -- Tool configuration (semgrep rules, codespell)
+scripts/       -- Utility scripts
+data/          -- Input/output data directories
+reports/       -- Generated reports (coverage, security)
+```
+
+### CI Pipeline Order
+
+The CI pipeline runs checks in this order (fail-fast):
+1. `init` -- Install dependencies
+2. `code-format` -- Auto-format code
+3. `code-style` -- Check formatting
+4. `code-typecheck` -- cargo check + clippy
+5. `code-security` -- cargo-geiger unsafe code scan
+6. `code-deptry` -- cargo-machete unused dependency check
+7. `code-spell` -- codespell spelling check
+8. `code-semgrep` -- Semgrep custom rules
+9. `code-audit` -- cargo-deny advisory/license/ban check
+10. `test` -- cargo-nextest test runner
+
+### Error Handling Pattern
+
+```rust
+use anyhow::{Context, Result};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum AppError {
+    #[error("failed to process: {0}")]
+    Processing(String),
+}
+
+pub fn do_work() -> Result<()> {
+    let data = std::fs::read_to_string("input.txt")
+        .context("failed to read input file")?;
+    Ok(())
+}
+```

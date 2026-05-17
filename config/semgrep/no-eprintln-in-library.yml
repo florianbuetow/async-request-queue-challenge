@@ -1,0 +1,14 @@
+rules:
+  - id: rust.no-eprintln-in-library
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Do not use eprintln! in library/runtime logic. Convert this to explicit
+      error propagation, a typed error variant, or structured logging.
+    pattern: eprintln!(...)
+    paths:
+      include:
+        - src/
+        - tests/
+      exclude:
+        - /src/main.rs

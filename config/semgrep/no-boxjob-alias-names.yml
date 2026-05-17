@@ -1,0 +1,23 @@
+rules:
+  - id: rust.no-boxjobfuture-alias-name
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Do not reintroduce BoxJobFuture-style aliases. The prior review explicitly
+      flagged this as readability-reducing.
+    pattern-regex: 'type\s+BoxJobFuture\b'
+    paths:
+      include:
+        - src/
+        - tests/
+
+  - id: rust.no-boxjobfactory-alias-name
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Do not reintroduce BoxJobFactory-style aliases. Use direct signatures.
+    pattern-regex: 'type\s+BoxJobFactory\b'
+    paths:
+      include:
+        - src/
+        - tests/

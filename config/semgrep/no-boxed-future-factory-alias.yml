@@ -1,0 +1,24 @@
+rules:
+  - id: rust.no-boxed-future-type-alias
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Do not hide boxed future internals behind a type alias. This pattern made
+      the previous BoxJobFuture-style code harder to read and review.
+    pattern-regex: 'type\s+[A-Za-z0-9_]+\s*(<[^>]+>)?\s*=\s*Pin\s*<\s*Box\s*<\s*dyn\s+Future\b'
+    paths:
+      include:
+        - src/
+        - tests/
+
+  - id: rust.no-boxed-future-factory-alias
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Do not add nested factory aliases returning another alias (BoxJobFactory-style).
+      Use direct readable signatures instead of alias chains.
+    pattern-regex: 'type\s+[A-Za-z0-9_]+\s*(<[^>]+>)?\s*=\s*Box\s*<\s*dyn\s+FnOnce\s*\(\s*\)\s*->\s*[^+>][^+]*\+\s*Send\s*\+\s*\x27static\s*>'
+    paths:
+      include:
+        - src/
+        - tests/

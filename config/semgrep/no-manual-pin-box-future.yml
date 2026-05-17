@@ -1,0 +1,12 @@
+rules:
+  - id: rust.no-manual-pin-box-future
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Avoid manual Pin<Box<dyn Future<...>>> constructions. Use futures::future::BoxFuture
+      (and FutureExt::boxed() where needed) for readability and consistency.
+    pattern-regex: 'Pin\s*<\s*Box\s*<\s*dyn\s+Future\b'
+    paths:
+      include:
+        - src/
+        - tests/

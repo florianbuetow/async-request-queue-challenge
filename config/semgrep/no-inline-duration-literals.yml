@@ -1,0 +1,14 @@
+rules:
+  - id: rust.no-inline-duration-literals
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Avoid inline Duration numeric literals. Use named constants so timeout/timing
+      assumptions are explicit, reviewable, and shared.
+    pattern-regex: 'Duration::from_(millis|secs)\(\s*[0-9_]+\s*\)'
+    paths:
+      include:
+        - src/
+        - tests/
+      exclude:
+        - /src/main.rs

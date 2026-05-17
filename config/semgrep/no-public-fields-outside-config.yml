@@ -1,0 +1,11 @@
+rules:
+  - id: rust.no-public-fields-outside-config
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Public fields are discouraged for non-configuration structs. Keep fields private
+      and expose constructor/getter methods unless the type is a *Config DTO.
+    pattern-regex: 'pub\s+struct\s+(?![A-Za-z0-9_]*Config\b)[A-Za-z0-9_]+\s*\{[\s\S]*?\bpub\s+[A-Za-z0-9_]+\s*:'
+    paths:
+      include:
+        - src/

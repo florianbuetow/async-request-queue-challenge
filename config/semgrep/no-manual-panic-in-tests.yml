@@ -1,0 +1,12 @@
+rules:
+  - id: rust.no-manual-panic-in-tests
+    languages: [rust]
+    severity: ERROR
+    message: >
+      Avoid manual panic! branches in tests. Prefer assert!/assert_eq!/matches! based
+      checks so failures clearly express expected vs actual behavior.
+    pattern: panic!(...)
+    paths:
+      include:
+        - src/
+        - tests/

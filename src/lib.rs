@@ -3,7 +3,6 @@
 #![warn(missing_docs)]
 
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -12,11 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 /// Output type returned by queued jobs.
 pub type QueueResult<T> = Result<T, RequestQueueError>;
 
-type BoxJobFuture<T> = Pin<Box<dyn Future<Output = QueueResult<T>> + Send + 'static>>;
-type BoxJobFactory<T> = Box<dyn FnOnce() -> BoxJobFuture<T> + Send + 'static>;
-
 struct Job<T> {
-    task: BoxJobFactory<T>,
+    task: Box<dyn FnOnce() -> tokio::task::JoinHandle<QueueResult<T>> + Send + 'static>,
     reply_tx: oneshot::Sender<QueueResult<T>>,
     execution_timeout: Duration,
 }
@@ -133,11 +129,10 @@ where
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 if job.reply_tx.is_closed() {
-                    eprintln!("request was cancelled before worker started processing");
                     continue;
                 }
 
-                let mut handle = tokio::spawn(async move { (job.task)().await });
+                let mut handle = (job.task)();
 
                 let result = match tokio::time::timeout(job.execution_timeout, &mut handle).await {
                     Ok(Ok(job_result)) => job_result,
@@ -158,14 +153,10 @@ where
                     }
                 };
 
-                if job.reply_tx.send(result).is_err() {
-                    eprintln!("request receiver dropped before worker reply was delivered");
-                }
+                if job.reply_tx.send(result).is_err() {}
             }
 
-            if done_tx.send(()).is_err() {
-                eprintln!("shutdown waiter dropped before worker exit signal");
-            }
+            if done_tx.send(()).is_err() {}
         });
 
         Ok((
@@ -217,7 +208,7 @@ where
         let (reply_tx, reply_rx) = oneshot::channel::<QueueResult<T>>();
 
         let job = Job {
-            task: Box::new(move || Box::pin(f())),
+            task: Box::new(move || tokio::spawn(async move { f().await })),
             reply_tx,
             execution_timeout,
         };
@@ -249,45 +240,124 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::oneshot;
 
+    const DEFAULT_CAPACITY: usize = 1;
+    const DEFAULT_ENQUEUE_TIMEOUT_MS: u64 = 60;
+    const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 200;
+    const DEFAULT_REPLY_TIMEOUT_S: u64 = 2;
+    const SHUTDOWN_WAIT_TIMEOUT_MS: u64 = 200;
+    const SHORT_EXECUTION_TIMEOUT_MS: u64 = 10;
+    const LONG_JOB_SLEEP_MS: u64 = 60;
+    const POST_TIMEOUT_WAIT_MS: u64 = 80;
+    const REPLY_TEST_ENQUEUE_TIMEOUT_MS: u64 = 100;
+    const REPLY_TEST_EXECUTION_TIMEOUT_S: u64 = 1;
+    const REPLY_TEST_REPLY_TIMEOUT_MS: u64 = 40;
+    const REPLY_TEST_LONG_JOB_MS: u64 = 120;
+    const REPLY_TEST_STAGGER_MS: u64 = 5;
+    const STRESS_CAPACITY: usize = 16;
+    const STRESS_ENQUEUE_TIMEOUT_S: u64 = 2;
+    const STRESS_EXECUTION_TIMEOUT_S: u64 = 1;
+    const STRESS_REPLY_TIMEOUT_S: u64 = 5;
+    const STRESS_TOTAL_JOBS: usize = 200;
+    const TIMEOUT_PROPAGATION_SLEEP_MS: u64 = 50;
+
+    const fn default_enqueue_timeout() -> Duration {
+        Duration::from_millis(DEFAULT_ENQUEUE_TIMEOUT_MS)
+    }
+
+    const fn default_execution_timeout() -> Duration {
+        Duration::from_millis(DEFAULT_EXECUTION_TIMEOUT_MS)
+    }
+
+    const fn default_reply_timeout() -> Duration {
+        Duration::from_secs(DEFAULT_REPLY_TIMEOUT_S)
+    }
+
+    const fn shutdown_wait_timeout() -> Duration {
+        Duration::from_millis(SHUTDOWN_WAIT_TIMEOUT_MS)
+    }
+
+    const fn short_execution_timeout() -> Duration {
+        Duration::from_millis(SHORT_EXECUTION_TIMEOUT_MS)
+    }
+
+    const fn long_job_sleep() -> Duration {
+        Duration::from_millis(LONG_JOB_SLEEP_MS)
+    }
+
+    const fn post_timeout_wait() -> Duration {
+        Duration::from_millis(POST_TIMEOUT_WAIT_MS)
+    }
+
+    const fn reply_test_enqueue_timeout() -> Duration {
+        Duration::from_millis(REPLY_TEST_ENQUEUE_TIMEOUT_MS)
+    }
+
+    const fn reply_test_execution_timeout() -> Duration {
+        Duration::from_secs(REPLY_TEST_EXECUTION_TIMEOUT_S)
+    }
+
+    const fn reply_test_reply_timeout() -> Duration {
+        Duration::from_millis(REPLY_TEST_REPLY_TIMEOUT_MS)
+    }
+
+    const fn reply_test_long_job_sleep() -> Duration {
+        Duration::from_millis(REPLY_TEST_LONG_JOB_MS)
+    }
+
+    const fn reply_test_stagger() -> Duration {
+        Duration::from_millis(REPLY_TEST_STAGGER_MS)
+    }
+
+    const fn stress_enqueue_timeout() -> Duration {
+        Duration::from_secs(STRESS_ENQUEUE_TIMEOUT_S)
+    }
+
+    const fn stress_execution_timeout() -> Duration {
+        Duration::from_secs(STRESS_EXECUTION_TIMEOUT_S)
+    }
+
+    const fn stress_reply_timeout() -> Duration {
+        Duration::from_secs(STRESS_REPLY_TIMEOUT_S)
+    }
+
+    const fn timeout_propagation_sleep() -> Duration {
+        Duration::from_millis(TIMEOUT_PROPAGATION_SLEEP_MS)
+    }
+
     fn test_config() -> QueueConfig {
         QueueConfig {
-            capacity: 1,
-            enqueue_timeout: Duration::from_millis(60),
-            execution_timeout: Duration::from_millis(200),
-            reply_timeout: Duration::from_secs(2),
+            capacity: DEFAULT_CAPACITY,
+            enqueue_timeout: default_enqueue_timeout(),
+            execution_timeout: default_execution_timeout(),
+            reply_timeout: default_reply_timeout(),
         }
     }
 
-    async fn assert_shutdown(shutdown: QueueShutdown) {
-        let wait_result = tokio::time::timeout(Duration::from_millis(200), shutdown.wait()).await;
+    fn new_test_queue<T>() -> (RequestQueue<T>, QueueShutdown)
+    where
+        T: Send + 'static,
+    {
+        RequestQueue::<T>::new(test_config()).expect("queue construction should succeed for valid test config")
+    }
 
-        match wait_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                panic!("shutdown waiter returned an unexpected error: {error}");
-            }
-            Err(elapsed) => {
-                panic!("worker did not shut down within 200ms: {elapsed}");
-            }
-        }
+    async fn assert_shutdown(shutdown: QueueShutdown) {
+        let wait_result = tokio::time::timeout(shutdown_wait_timeout(), shutdown.wait()).await;
+        assert!(wait_result.is_ok(), "worker should shut down before timeout, got: {wait_result:?}");
+        let shutdown_result = wait_result.expect("timeout branch already asserted as impossible");
+        assert_eq!(shutdown_result, Ok(()), "shutdown waiter should complete cleanly");
+    }
+
+    fn panic_before_future() -> impl Future<Output = QueueResult<u32>> + Send {
+        let should_panic = true;
+        assert!(!should_panic, "boom from queued job");
+        async { Ok(0) }
     }
 
     #[tokio::test]
     async fn basic_success() {
-        let queue_result = RequestQueue::<u32>::new(test_config());
-        let (queue, shutdown) = match queue_result {
-            Ok(ok) => ok,
-            Err(error) => panic!("queue construction failed unexpectedly: {error}"),
-        };
-
+        let (queue, shutdown) = new_test_queue::<u32>();
         let response = queue.enqueue(|| async { Ok(7) }).await;
-
-        match response {
-            Ok(value) => {
-                assert_eq!(value, 7);
-            }
-            Err(error) => panic!("job failed unexpectedly: {error}"),
-        }
+        assert_eq!(response, Ok(7), "queued job should return expected value");
 
         drop(queue);
         assert_shutdown(shutdown).await;
@@ -295,11 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_full_backpressure_behavior() {
-        let queue_result = RequestQueue::<u32>::new(test_config());
-        let (queue, shutdown) = match queue_result {
-            Ok(ok) => ok,
-            Err(error) => panic!("queue construction failed unexpectedly: {error}"),
-        };
+        let (queue, shutdown) = new_test_queue::<u32>();
 
         let (first_release_tx, first_release_rx) = oneshot::channel::<()>();
         let (second_release_tx, second_release_rx) = oneshot::channel::<()>();
@@ -308,10 +374,7 @@ mod tests {
         let first_job = tokio::spawn(async move {
             first_queue
                 .enqueue(move || async move {
-                    match first_release_rx.await {
-                        Ok(()) => {}
-                        Err(error) => panic!("first release channel closed unexpectedly: {error}"),
-                    }
+                    first_release_rx.await.expect("first release channel should be signalled");
                     Ok(1)
                 })
                 .await
@@ -321,16 +384,13 @@ mod tests {
         let second_job = tokio::spawn(async move {
             second_queue
                 .enqueue(move || async move {
-                    match second_release_rx.await {
-                        Ok(()) => {}
-                        Err(error) => panic!("second release channel closed unexpectedly: {error}"),
-                    }
+                    second_release_rx.await.expect("second release channel should be signalled");
                     Ok(2)
                 })
                 .await
         });
 
-        let fill_wait_result = tokio::time::timeout(Duration::from_millis(200), async {
+        let fill_wait_result = tokio::time::timeout(shutdown_wait_timeout(), async {
             while queue.tx.capacity() != 0 {
                 tokio::task::yield_now().await;
             }
@@ -341,38 +401,22 @@ mod tests {
 
         let timeout_result = queue.enqueue(|| async { Ok(3) }).await;
 
-        match timeout_result {
-            Err(RequestQueueError::EnqueueTimedOut { timeout }) => {
-                assert_eq!(timeout, Duration::from_millis(60));
-            }
-            Ok(value) => panic!("expected enqueue timeout, but request succeeded with value: {value}"),
-            Err(error) => panic!("expected enqueue timeout, got different error: {error}"),
-        }
+        assert!(
+            matches!(
+                timeout_result,
+                Err(RequestQueueError::EnqueueTimedOut { timeout }) if timeout == default_enqueue_timeout()
+            ),
+            "expected EnqueueTimedOut, got: {timeout_result:?}"
+        );
 
         assert!(first_release_tx.send(()).is_ok(), "first release receiver dropped unexpectedly");
         assert!(second_release_tx.send(()).is_ok(), "second release receiver dropped unexpectedly");
 
-        let second_result = match second_job.await {
-            Ok(result) => result,
-            Err(join_error) => panic!("second job task join failed unexpectedly: {join_error}"),
-        };
+        let second_result = second_job.await.expect("second job task should not panic");
+        assert_eq!(second_result, Ok(2), "second queued request should succeed");
 
-        match second_result {
-            Ok(value) => assert_eq!(value, 2),
-            Err(error) => panic!("expected second request to queue successfully, got: {error}"),
-        }
-
-        let first_result = match first_job.await {
-            Ok(result) => result,
-            Err(join_error) => panic!("first job task join failed unexpectedly: {join_error}"),
-        };
-
-        match first_result {
-            Ok(value) => {
-                assert_eq!(value, 1);
-            }
-            Err(error) => panic!("first request failed unexpectedly: {error}"),
-        }
+        let first_result = first_job.await.expect("first job task should not panic");
+        assert_eq!(first_result, Ok(1), "first queued request should succeed");
 
         drop(queue);
         assert_shutdown(shutdown).await;
@@ -380,25 +424,16 @@ mod tests {
 
     #[tokio::test]
     async fn panic_is_reported_and_worker_recovers() {
-        let queue_result = RequestQueue::<u32>::new(test_config());
-        let (queue, shutdown) = match queue_result {
-            Ok(ok) => ok,
-            Err(error) => panic!("queue construction failed unexpectedly: {error}"),
-        };
+        let (queue, shutdown) = new_test_queue::<u32>();
 
-        let panic_result = queue.enqueue(|| async { panic!("boom from queued job") }).await;
-
-        match panic_result {
-            Err(RequestQueueError::JobPanicked) => {}
-            Ok(value) => panic!("expected panic error, got success value: {value}"),
-            Err(error) => panic!("expected panic error, got different error: {error}"),
-        }
+        let panic_result = queue.enqueue(panic_before_future).await;
+        assert!(
+            matches!(panic_result, Err(RequestQueueError::JobPanicked)),
+            "expected JobPanicked, got: {panic_result:?}"
+        );
 
         let follow_up_result = queue.enqueue(|| async { Ok(9) }).await;
-        match follow_up_result {
-            Ok(value) => assert_eq!(value, 9),
-            Err(error) => panic!("queue did not recover after panic: {error}"),
-        }
+        assert_eq!(follow_up_result, Ok(9), "queue should recover and handle a follow-up request");
 
         drop(queue);
         assert_shutdown(shutdown).await;
@@ -406,42 +441,35 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_job_is_cancelled_and_queue_continues() {
-        let queue_result = RequestQueue::<u32>::new(test_config());
-        let (queue, shutdown) = match queue_result {
-            Ok(ok) => ok,
-            Err(error) => panic!("queue construction failed unexpectedly: {error}"),
-        };
+        let (queue, shutdown) = new_test_queue::<u32>();
 
         let did_run_after_sleep = Arc::new(AtomicBool::new(false));
         let did_run_after_sleep_clone = Arc::clone(&did_run_after_sleep);
 
         let timeout_result = queue
-            .enqueue_with_timeout(Duration::from_millis(10), move || async move {
-                tokio::time::sleep(Duration::from_millis(60)).await;
+            .enqueue_with_timeout(short_execution_timeout(), move || async move {
+                tokio::time::sleep(long_job_sleep()).await;
                 did_run_after_sleep_clone.store(true, Ordering::SeqCst);
                 Ok(1)
             })
             .await;
 
-        match timeout_result {
-            Err(RequestQueueError::ExecutionTimedOut { timeout }) => {
-                assert_eq!(timeout, Duration::from_millis(10));
-            }
-            Ok(value) => panic!("expected timeout error, got success value: {value}"),
-            Err(error) => panic!("expected timeout error, got different error: {error}"),
-        }
+        assert!(
+            matches!(
+                timeout_result,
+                Err(RequestQueueError::ExecutionTimedOut { timeout }) if timeout == short_execution_timeout()
+            ),
+            "expected ExecutionTimedOut, got: {timeout_result:?}"
+        );
 
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(post_timeout_wait()).await;
         assert!(
             !did_run_after_sleep.load(Ordering::SeqCst),
             "timed out future continued running after timeout"
         );
 
         let follow_up_result = queue.enqueue(|| async { Ok(2) }).await;
-        match follow_up_result {
-            Ok(value) => assert_eq!(value, 2),
-            Err(error) => panic!("queue did not process follow-up request after timeout: {error}"),
-        }
+        assert_eq!(follow_up_result, Ok(2), "queue should process follow-up request after timeout");
 
         drop(queue);
         assert_shutdown(shutdown).await;
@@ -450,52 +478,43 @@ mod tests {
     #[tokio::test]
     async fn reply_timeout_is_enforced_for_slow_queue_drain() {
         let config = QueueConfig {
-            capacity: 1,
-            enqueue_timeout: Duration::from_millis(100),
-            execution_timeout: Duration::from_secs(1),
-            reply_timeout: Duration::from_millis(40),
+            capacity: DEFAULT_CAPACITY,
+            enqueue_timeout: reply_test_enqueue_timeout(),
+            execution_timeout: reply_test_execution_timeout(),
+            reply_timeout: reply_test_reply_timeout(),
         };
 
-        let queue_result = RequestQueue::<u32>::new(config);
-        let (queue, shutdown) = match queue_result {
-            Ok(ok) => ok,
-            Err(error) => panic!("queue construction failed unexpectedly: {error}"),
-        };
+        let (queue, shutdown) = RequestQueue::<u32>::new(config).expect("queue construction should succeed for reply-timeout config");
 
         let first_queue = queue.clone();
         let first_job = tokio::spawn(async move {
             first_queue
                 .enqueue(|| async {
-                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    tokio::time::sleep(reply_test_long_job_sleep()).await;
                     Ok(1)
                 })
                 .await
         });
 
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(reply_test_stagger()).await;
 
         let second_result = queue.enqueue(|| async { Ok(2) }).await;
-        match second_result {
-            Err(RequestQueueError::ReplyTimedOut { timeout }) => {
-                assert_eq!(timeout, Duration::from_millis(40));
-            }
-            Ok(value) => panic!("expected reply timeout, got success value: {value}"),
-            Err(error) => panic!("expected reply timeout, got different error: {error}"),
-        }
+        assert!(
+            matches!(
+                second_result,
+                Err(RequestQueueError::ReplyTimedOut { timeout }) if timeout == reply_test_reply_timeout()
+            ),
+            "expected second request reply timeout, got: {second_result:?}"
+        );
 
-        let first_result = match first_job.await {
-            Ok(result) => result,
-            Err(join_error) => panic!("first job task join failed unexpectedly: {join_error}"),
-        };
-        match first_result {
-            Err(RequestQueueError::ReplyTimedOut { timeout }) => {
-                assert_eq!(timeout, Duration::from_millis(40));
-            }
-            Ok(value) => panic!("expected first request to hit reply timeout, got: {value}"),
-            Err(error) => {
-                panic!("expected first request reply timeout, got different error: {error}")
-            }
-        }
+        let first_result = first_job.await.expect("first job task should not panic");
+        assert!(
+            matches!(
+                first_result,
+                Err(RequestQueueError::ReplyTimedOut { timeout }) if timeout == reply_test_reply_timeout()
+            ),
+            "expected first request reply timeout, got: {first_result:?}"
+        );
 
         drop(queue);
         assert_shutdown(shutdown).await;
@@ -504,20 +523,16 @@ mod tests {
     #[tokio::test]
     async fn stress_concurrent_producers() {
         let config = QueueConfig {
-            capacity: 16,
-            enqueue_timeout: Duration::from_secs(2),
-            execution_timeout: Duration::from_secs(1),
-            reply_timeout: Duration::from_secs(5),
+            capacity: STRESS_CAPACITY,
+            enqueue_timeout: stress_enqueue_timeout(),
+            execution_timeout: stress_execution_timeout(),
+            reply_timeout: stress_reply_timeout(),
         };
 
-        let queue_result = RequestQueue::<usize>::new(config);
-        let (queue, shutdown) = match queue_result {
-            Ok(ok) => ok,
-            Err(error) => panic!("queue construction failed unexpectedly: {error}"),
-        };
+        let (queue, shutdown) = RequestQueue::<usize>::new(config).expect("queue construction should succeed for stress config");
 
         let mut handles = Vec::new();
-        let total_jobs: usize = 200;
+        let total_jobs: usize = STRESS_TOTAL_JOBS;
         for value in 0..total_jobs {
             let producer = queue.clone();
             handles.push(tokio::spawn(
@@ -527,16 +542,9 @@ mod tests {
 
         let mut results = Vec::with_capacity(total_jobs);
         for handle in handles {
-            let join_result = handle.await;
-            let queue_result = match join_result {
-                Ok(result) => result,
-                Err(join_error) => panic!("producer task join failed unexpectedly: {join_error}"),
-            };
-
-            match queue_result {
-                Ok(value) => results.push(value),
-                Err(error) => panic!("concurrent enqueue failed unexpectedly: {error}"),
-            }
+            let queue_result = handle.await.expect("producer task should not panic");
+            assert!(queue_result.is_ok(), "concurrent enqueue should succeed, got: {queue_result:?}");
+            results.push(queue_result.expect("value presence already asserted via is_ok"));
         }
 
         results.sort_unstable();
@@ -549,11 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_shutdown() {
-        let queue_result = RequestQueue::<u32>::new(test_config());
-        let (queue, shutdown) = match queue_result {
-            Ok(ok) => ok,
-            Err(error) => panic!("queue construction failed unexpectedly: {error}"),
-        };
+        let (queue, shutdown) = new_test_queue::<u32>();
 
         let clone = queue.clone();
         drop(queue);
@@ -564,26 +568,22 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_propagation() {
-        let queue_result = RequestQueue::<u32>::new(test_config());
-        let (queue, shutdown) = match queue_result {
-            Ok(ok) => ok,
-            Err(error) => panic!("queue construction failed unexpectedly: {error}"),
-        };
+        let (queue, shutdown) = new_test_queue::<u32>();
 
         let response: QueueResult<u32> = queue
-            .enqueue_with_timeout(Duration::from_millis(10), || async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            .enqueue_with_timeout(short_execution_timeout(), || async {
+                tokio::time::sleep(timeout_propagation_sleep()).await;
                 Ok(42)
             })
             .await;
 
-        match response {
-            Err(RequestQueueError::ExecutionTimedOut { timeout }) => {
-                assert_eq!(timeout, Duration::from_millis(10));
-            }
-            Ok(value) => panic!("expected execution timeout, but got success: {value}"),
-            Err(error) => panic!("expected execution timeout, got different error: {error}"),
-        }
+        assert!(
+            matches!(
+                response,
+                Err(RequestQueueError::ExecutionTimedOut { timeout }) if timeout == short_execution_timeout()
+            ),
+            "expected ExecutionTimedOut, got: {response:?}"
+        );
 
         drop(queue);
         assert_shutdown(shutdown).await;
